@@ -1,0 +1,8 @@
+{
+  "repos": [],
+  "poll_interval": 60,
+  "jitter": 15,
+  "max_fails_before_skip": 5,
+  "use_api": false,
+  "last_command_hash": ""
+}

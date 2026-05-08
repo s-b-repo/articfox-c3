@@ -1,0 +1,29 @@
+{
+  "scan": {
+    "ports": [23, 2323],
+    "scan_timeout": 1.0,
+    "brute_timeout": 20,
+    "max_brute_parallel": 32,
+    "scanner_threads": 24,
+    "brute_threads": 24,
+    "ring_buffer_size": 16384,
+    "status_interval": 8,
+    "rate_limit": 0,
+    "bypass_timeout": 15,
+    "honeypot_patterns": [
+      "cowrie",
+      "honeypot",
+      "HoneyTel",
+      "sensor",
+      "Decoy",
+      "My honeypot",
+      "this system is monitored",
+      "forensics",
+      "Kippo",
+      "kippo",
+      "TCP Forwarder"
+    ]
+  },
+  "creds_file": "",
+  "output_dir": "output"
+}

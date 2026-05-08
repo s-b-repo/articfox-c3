@@ -1,0 +1,7 @@
+{
+  "admin_token": "",
+  "lints_token": "",
+  "host": "0.0.0.0",
+  "port": 7443,
+  "use_pad": false
+}
