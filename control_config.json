@@ -1,0 +1,9 @@
+{
+  "github_token": "",
+  "gitlab_token": "",
+  "repos": [],
+  "commands": [],
+  "heartbeat_redirect": "",
+  "heartbeat_tracking": "",
+  "heartbeat_interval": 300
+}
