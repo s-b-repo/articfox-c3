@@ -1,6 +1,6 @@
 # arcticfox-C3
 
-prevuis name was snow fox i bought it and then improved it alot the idea was solid but nothing was worknig
+prevuis name was snow fox 
 > Educational C3 framework demonstrating **C2-free botnets** using GitHub, GitLab, and Debian paste dead-drops with zero-width Unicode steganography.
 
 arcticfox-C3 is a proof-of-concept Python framework showing how modern botnets operate without traditional C2 servers. Commands are hidden in invisible zero-width Unicode characters inside ordinary README files. No listening ports, no custom protocols, no network signatures.

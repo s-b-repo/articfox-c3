@@ -37,8 +37,9 @@ def encode(data: bytes) -> str:
 
 def decode(zw_text: str) -> bytes:
     chars = [c for c in zw_text if c in ZW_SET]
+    usable = len(chars) - len(chars) % 4
     result = bytearray()
-    for i in range(0, len(chars) - 3, 4):
+    for i in range(0, usable, 4):
         b = (ZW_MAP[chars[i]] << 6
              | ZW_MAP[chars[i+1]] << 4
              | ZW_MAP[chars[i+2]] << 2
