@@ -447,3 +447,14 @@ This project is for **educational and authorized security research only**. It de
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+<details>
+<summary><sub>Support this project</sub></summary>
+<p align="center"><br/>
+If this tool saved you time, consider tossing $1 in Monero:<br/><br/>
+<code>478Lb78LDscQ8ukEDTZqXgEtjoBX1jMuVGvgfy2RagxZZk89YuyVYsganfLUKnwggz8YiBxhG25yWWiHUppG9uarSiseseY</code><br/><br/>
+<sub>XMR — private, untraceable, appreciated.</sub>
+</p>
+</details>
