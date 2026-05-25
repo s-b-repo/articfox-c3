@@ -24,6 +24,7 @@ class ScanConfig:
         "cowrie", "honeypot", "HoneyTel", "sensor", "Decoy", "My honeypot",
         "this system is monitored", "forensics", "Kippo", "kippo", "TCP Forwarder",
     ])
+    proxy_list: list = field(default_factory=list)
 
 @dataclass
 class OogaConfig:

