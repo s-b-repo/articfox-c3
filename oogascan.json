@@ -1,6 +1,9 @@
 {
   "scan": {
-    "ports": [23, 2323],
+    "ports": [
+      23,
+      2323
+    ],
     "scan_timeout": 1.0,
     "brute_timeout": 20,
     "max_brute_parallel": 32,
@@ -22,7 +25,8 @@
       "Kippo",
       "kippo",
       "TCP Forwarder"
-    ]
+    ],
+    "proxy_list": []
   },
   "creds_file": "",
   "output_dir": "output"

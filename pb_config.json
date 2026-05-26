@@ -1,5 +1,26 @@
 {
-  "repos": [],
+  "repos": [
+    {
+      "owner": "testuser",
+      "repo": "testrepo",
+      "platform": "github",
+      "branch": "main",
+      "file_path": "README.md",
+      "fail_count": 0,
+      "last_fail": 0.0,
+      "last_success": 0.0
+    },
+    {
+      "owner": "testuser",
+      "repo": "backup",
+      "platform": "gitlab",
+      "branch": "main",
+      "file_path": "README.md",
+      "fail_count": 0,
+      "last_fail": 0.0,
+      "last_success": 0.0
+    }
+  ],
   "poll_interval": 60,
   "jitter": 15,
   "max_fails_before_skip": 5,
